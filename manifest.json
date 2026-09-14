@@ -9,15 +9,38 @@
   "license": "Apache-2.0",
   "executable": "assemblyai-addon/assemblyai-addon",
   "protocol": 1,
+  "uses_subtitld_cloud": true,
   "startup_timeout_sec": 30,
-  "platforms": ["linux", "macos", "windows"],
-  "tasks": ["asr.transcribe"],
+  "platforms": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "tasks": [
+    "asr.transcribe"
+  ],
   "languages": [
-    "en", "en-us", "en-gb", "en-au",
-    "es", "fr", "de", "it",
-    "pt", "pt-br",
-    "nl", "hi", "ja", "zh",
-    "fi", "ko", "pl", "ru", "tr", "uk", "vi"
+    "en",
+    "en-us",
+    "en-gb",
+    "en-au",
+    "es",
+    "fr",
+    "de",
+    "it",
+    "pt",
+    "pt-br",
+    "nl",
+    "hi",
+    "ja",
+    "zh",
+    "fi",
+    "ko",
+    "pl",
+    "ru",
+    "tr",
+    "uk",
+    "vi"
   ],
   "models": [],
   "disk_required_mb": 50,
@@ -37,8 +60,14 @@
         "label": "Model",
         "default": "subtitld-cloud:assemblyai/best",
         "options": [
-          { "value": "subtitld-cloud:assemblyai/best", "label": "Best — highest accuracy" },
-          { "value": "subtitld-cloud:assemblyai/nano", "label": "Nano — faster and cheaper, more languages" }
+          {
+            "value": "subtitld-cloud:assemblyai/best",
+            "label": "Best — highest accuracy"
+          },
+          {
+            "value": "subtitld-cloud:assemblyai/nano",
+            "label": "Nano — faster and cheaper, more languages"
+          }
         ],
         "description": "Which AssemblyAI tier to use. The authoritative list lives at /api/v1/catalog?provider=assemblyai — if a model here is rejected as unknown, refresh the catalog from the Subtitld Cloud dashboard."
       },
