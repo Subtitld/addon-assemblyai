@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Build per-platform PyInstaller bundles, package each into a release zip
+# matching Subtitld's add-on naming convention, and (on tag push) attach
+# them to a GitHub Release. The release artefacts are also referenced by
+# the Subtitld catalog (https://subtitld.github.io/addons-catalog) — when
+# this workflow uploads, the catalog repo's update workflow picks the new
+# release up via the GitHub API.
+
+permissions:
+  contents: write   # needed to create the release on tag push
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The suite drives the add-on as a real subprocess against a local
+      # fake cloud, and the encode step shells out to ffmpeg. Without it
+      # the end-to-end tests skip themselves and the build would ship
+      # untested — so install it rather than let them quietly vanish.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Run tests
+        run: pytest -q
+
+  build:
+    name: Build ${{ matrix.platform_label }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform_label: linux-x86_64
+            platform: linux
+            arch: x86_64
+            archive_ext: zip
+          - os: macos-14   # Apple Silicon; the catalog can't distinguish mac
+                           # arch, so ship one macOS build (arm64).
+            platform_label: macos-arm64
+            platform: macos
+            arch: arm64
+            archive_ext: zip
+          - os: windows-2022
+            platform_label: windows-x86_64
+            platform: windows
+            arch: x86_64
+            archive_ext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[build]'
+
+      - name: Build PyInstaller bundle
+        shell: bash
+        run: |
+          pyinstaller pyinstaller.spec --noconfirm
+
+      - name: Stage release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read the manifest version so the archive name and the manifest
+          # never drift out of sync — bumping `manifest.json:version` is
+          # all that's needed for a new release.
+          version=$(python -c "import json; print(json.load(open('manifest.json'))['version'])")
+          rm -rf release-staging
+          mkdir -p release-staging/assemblyai-addon
+          # PyInstaller --onedir output → folder at the archive root.
+          cp -r dist/assemblyai-addon/. release-staging/assemblyai-addon/
+          # manifest.json / LICENSE / README at the archive ROOT — that's where
+          # Subtitld's installer reads manifest.json from (install_from_zip).
+          cp manifest.json LICENSE README.md release-staging/
+          archive_name="assemblyai-${version}-${{ matrix.platform_label }}.zip"
+          ( cd release-staging && \
+            python -c "import shutil,sys; shutil.make_archive(sys.argv[1], 'zip', '.')" "../${archive_name%.zip}" )
+          ls -lah "$archive_name"
+          echo "ARCHIVE_NAME=$archive_name" >> "$GITHUB_ENV"
+
+      - name: Compute checksum
+        shell: bash
+        run: |
+          python -c "import hashlib, sys; print(hashlib.sha256(open('${ARCHIVE_NAME}','rb').read()).hexdigest())" \
+            > "${ARCHIVE_NAME}.sha256"
+          cat "${ARCHIVE_NAME}.sha256"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform_label }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch all built artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+
+      - name: Flatten layout
+        shell: bash
+        run: |
+          mkdir -p release-files
+          find artefacts -type f -name 'assemblyai-*' -print -exec cp {} release-files/ \;
+          ls -lah release-files
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

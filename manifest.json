@@ -1,0 +1,68 @@
+{
+  "manifest_version": 1,
+  "id": "assemblyai",
+  "version": "1.0.0",
+  "display_name": "AssemblyAI (Subtitld Cloud)",
+  "summary": "Cloud speech-to-text via AssemblyAI, routed through Subtitld Cloud. High accuracy with speaker diarization; needs a Subtitld Cloud API key and an internet connection.",
+  "author": "Subtitld",
+  "homepage": "https://github.com/Subtitld/addon-assemblyai",
+  "license": "Apache-2.0",
+  "executable": "assemblyai-addon/assemblyai-addon",
+  "protocol": 1,
+  "startup_timeout_sec": 30,
+  "platforms": ["linux", "macos", "windows"],
+  "tasks": ["asr.transcribe"],
+  "languages": [
+    "en", "en-us", "en-gb", "en-au",
+    "es", "fr", "de", "it",
+    "pt", "pt-br",
+    "nl", "hi", "ja", "zh",
+    "fi", "ko", "pl", "ru", "tr", "uk", "vi"
+  ],
+  "models": [],
+  "disk_required_mb": 50,
+  "ram_required_mb": 256,
+  "gpu": "none",
+  "config_schema": {
+    "fields": [
+      {
+        "key": "api_key",
+        "type": "secret",
+        "label": "Subtitld Cloud API key",
+        "description": "Your Subtitld Cloud key — NOT an AssemblyAI key. Generate one at https://cloud.subtitld.org/dashboard/keys/. Shared with the other cloud-backed providers, so you only paste it once."
+      },
+      {
+        "key": "model",
+        "type": "select",
+        "label": "Model",
+        "default": "subtitld-cloud:assemblyai/best",
+        "options": [
+          { "value": "subtitld-cloud:assemblyai/best", "label": "Best — highest accuracy" },
+          { "value": "subtitld-cloud:assemblyai/nano", "label": "Nano — faster and cheaper, more languages" }
+        ],
+        "description": "Which AssemblyAI tier to use. The authoritative list lives at /api/v1/catalog?provider=assemblyai — if a model here is rejected as unknown, refresh the catalog from the Subtitld Cloud dashboard."
+      },
+      {
+        "key": "speaker_labels",
+        "type": "bool",
+        "label": "Detect speakers (diarization)",
+        "default": true,
+        "description": "Label each cue with the speaker who said it. Adds a little processing time upstream."
+      },
+      {
+        "key": "slice_by_phrases",
+        "type": "bool",
+        "label": "One cue per sentence",
+        "default": true,
+        "description": "On: one subtitle per sentence, as segmented by AssemblyAI. Off: one subtitle per speaker turn (longer cues). Has no effect when the server returns only speaker turns."
+      },
+      {
+        "key": "base_url",
+        "type": "string",
+        "label": "Cloud endpoint",
+        "default": "",
+        "description": "Advanced — leave empty to use https://cloud.subtitld.org. Set this only to point at a draft or self-hosted Subtitld Cloud server."
+      }
+    ]
+  }
+}

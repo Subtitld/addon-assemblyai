@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subtitld-addon-assemblyai"
+version = "1.0.0"
+description = "Subtitld add-on: cloud ASR via AssemblyAI, routed through Subtitld Cloud"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Subtitld", email = "jbopen@gmail.com" },
+]
+requires-python = ">=3.10"
+# Deliberately empty. Everything this add-on does — HTTP, multipart, JSON,
+# subprocess — is stdlib. Adding `requests` alone would roughly double the
+# frozen bundle for four API calls.
+dependencies = []
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0",
+]
+dev = [
+    "pytest>=7.4",
+]
+
+[project.scripts]
+assemblyai-addon = "assemblyai_addon.__main__:main"
+
+[tool.setuptools]
+packages = ["assemblyai_addon"]
