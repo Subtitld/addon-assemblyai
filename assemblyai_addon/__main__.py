@@ -90,7 +90,7 @@ from pathlib import Path
 from typing import Any
 
 ADDON_ID = 'assemblyai'
-ADDON_VERSION = '1.0.0'
+ADDON_VERSION = '1.0.1'
 PROTOCOL_VERSION = 1
 
 # The cloud namespaces every provider it relays. Part of the API contract —
@@ -123,8 +123,21 @@ log = logging.getLogger('assemblyai_addon')
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-_POLL_INTERVAL_SEC = 2.0
-_POLL_TIMEOUT_SEC = 15 * 60  # 15 minutes
+# Polling starts responsive and backs off. A flat 2 s was both wasteful and
+# self-defeating: a 30-minute file meant hundreds of requests against the same
+# endpoint, which is what tripped the cloud's rate limiter in the first place.
+_POLL_INTERVAL_START_SEC = 2.0
+_POLL_INTERVAL_MAX_SEC = 20.0
+_POLL_INTERVAL_GROWTH = 1.35
+
+# The job is already paid for by the time we are polling, so give up late
+# rather than early — an abandoned poll loop bins work the user was billed for.
+_POLL_TIMEOUT_SEC = 60 * 60  # 1 hour
+
+# How many CONSECUTIVE transient failures (429 / 5xx / network) end the poll.
+# One blip must never kill a finished job; a genuinely dead endpoint still
+# terminates in well under a minute of retries.
+_POLL_MAX_CONSECUTIVE_FAILURES = 6
 _HTTP_TIMEOUT_SEC = 120.0
 _UPLOAD_TIMEOUT_SEC = 600.0  # a long file at a bad uplink is still just one POST
 
@@ -271,15 +284,26 @@ class CloudHTTPError(Exception):
     it here, immediately, and carry the result.
     """
 
-    def __init__(self, status: int, body_text: str):
+    def __init__(self, status: int, body_text: str, headers=None):
         self.status = int(status)
         self.body_text = body_text or ''
-        try:
-            self.body = json.loads(self.body_text) if self.body_text else {}
-        except (ValueError, TypeError):
-            self.body = {}
-        if not isinstance(self.body, dict):
-            self.body = {}
+        self.headers = dict(headers or {})
+        # `json_ok` tracks whether the body PARSED, which is not the same as
+        # whether it has content: the API legitimately answers `{}`, and that
+        # empty-but-valid dict is falsy. Conflating the two made a valid JSON
+        # 404 look like a missing endpoint. An absent body stays `True` —
+        # only a body that is present and unparseable (an HTML error page from
+        # the edge, say) means we are not talking to the API at all.
+        self.json_ok = True
+        self.body = {}
+        if self.body_text:
+            try:
+                parsed = json.loads(self.body_text)
+            except (ValueError, TypeError):
+                self.json_ok = False
+            else:
+                if isinstance(parsed, dict):
+                    self.body = parsed
         super().__init__(f'HTTP {self.status}: {self.body_text[:300]}')
 
     @property
@@ -294,6 +318,32 @@ class CloudHTTPError(Exception):
     @property
     def upstream_status(self) -> Any:
         return self.body.get('upstream_status')
+
+    @property
+    def retry_after(self) -> float:
+        """Seconds the server asked us to wait, 0.0 when it didn't say.
+
+        Only the delta-seconds form is honoured; the HTTP-date form is rare
+        here and guessing at clock skew is worse than falling back to our own
+        backoff.
+        """
+        for key, value in self.headers.items():
+            if key.lower() != 'retry-after':
+                continue
+            try:
+                return max(0.0, float(str(value).strip()))
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
+    @property
+    def transient(self) -> bool:
+        """True when retrying the SAME request could plausibly succeed.
+
+        429 and 5xx are the cloud saying "not now", not "never". Treating them
+        as fatal is what threw away completed, already-billed jobs.
+        """
+        return self.status == 429 or 500 <= self.status < 600
 
 
 def _request(url: str, *, api_key: str, method: str = 'GET',
@@ -320,7 +370,7 @@ def _request(url: str, *, api_key: str, method: str = 'GET',
             detail = exc.read().decode('utf-8', errors='replace')
         except Exception:
             detail = ''
-        raise CloudHTTPError(exc.code, detail) from exc
+        raise CloudHTTPError(exc.code, detail, getattr(exc, 'headers', None)) from exc
 
     if not raw.strip():
         return {}
@@ -410,12 +460,30 @@ def _translate_http_error(exc: CloudHTTPError, base_url: str,
                 False)
 
     if status == 404:
-        # During submit this means the model id is unknown; during polling it
-        # means the job id is. Same status, different cause — say which.
+        # A 404 means one of three unrelated things, and saying the wrong one
+        # sends the user hunting the wrong problem.
+        #
+        # First: is the ENDPOINT itself missing? The API answers with JSON, so
+        # a 404 carrying a non-JSON body (an HTML error page from the edge or
+        # a bare origin) means we're talking to a host that doesn't serve this
+        # API at all — wrong `base_url`, or a server that isn't deployed yet.
+        # That is not a model problem and must not be reported as one.
+        if not exc.json_ok:
+            return (ERR_BAD_PARAMS,
+                    f'No Subtitld Cloud API at {base_url} — the server returned '
+                    f'"not found" for /api/v1/asr/. Check the Cloud endpoint '
+                    f'setting in the add-on configuration.',
+                    False)
+        # Otherwise the API answered, and the 404 is about the thing we named.
         if stage == 'poll':
             return (ERR_INTERNAL,
                     'Subtitld Cloud no longer knows this job id. It may have '
                     'expired; run the transcription again.',
+                    False)
+        if stage == 'upload':
+            return (ERR_INTERNAL,
+                    'Subtitld Cloud rejected the upload as not found. This is '
+                    'a server-side routing problem, not something to fix here.',
                     False)
         return (ERR_MODEL_MISSING,
                 'Unknown model — refresh the catalog in the add-on settings '
@@ -430,7 +498,9 @@ def _translate_http_error(exc: CloudHTTPError, base_url: str,
 
     if status == 429:
         return (ERR_NETWORK_UNAVAILABLE,
-                'Rate limited by Subtitld Cloud. Wait a moment and try again.',
+                f'Rate limited by Subtitld Cloud during {stage} (at {base_url}). '
+                'Wait a moment and try again; if it repeats, check that the '
+                'Cloud endpoint setting points at a live server.',
                 True)
 
     if status == 503:
@@ -995,15 +1065,41 @@ def _poll_until_done(state: _WorkerState, job_id: str, *,
                      base_url: str, api_key: str) -> dict | None:
     """Poll `/api/v1/jobs/<id>` until terminal. Returns None if cancelled.
 
-    Progress is mapped across 0.3 → 0.9 using the job's own `progress` when
-    the cloud reports one. When it doesn't, we creep asymptotically toward
-    0.9 instead of sitting still — a frozen bar reads as a hang, and we have
-    no honest completion estimate to show.
+    Transient failures do NOT end the job. By the time we are polling, the
+    audio is uploaded and the transcription is running and billed — bailing
+    out on one 429 or one 502 throws away work the user has already paid for
+    and cannot get back, because the job id dies with this function. So 429
+    and 5xx and network blips are retried with backoff, honouring
+    `Retry-After` when the server sends one, and only
+    `_POLL_MAX_CONSECUTIVE_FAILURES` failures IN A ROW give up.
+
+    The interval itself grows from `_POLL_INTERVAL_START_SEC` toward
+    `_POLL_INTERVAL_MAX_SEC`. A flat short interval is what provoked the rate
+    limiting: a long file meant hundreds of identical requests. Backing off
+    keeps the first few seconds responsive for short clips while making a
+    long job cost a couple of dozen requests instead of hundreds.
+
+    Progress maps to 0.3-0.9 using the job's own `progress` when the cloud
+    reports one; otherwise it creeps asymptotically toward 0.9, because a
+    frozen bar reads as a hang and we have no honest estimate to show.
     """
     req_id = state.req_id
     url = f'{base_url}/api/v1/jobs/{urllib.parse.quote(job_id)}'
     deadline = time.monotonic() + _POLL_TIMEOUT_SEC
+    interval = _POLL_INTERVAL_START_SEC
     polls = 0
+    consecutive_failures = 0
+    last_error = ''
+
+    def _sleep(seconds: float) -> bool:
+        """Sleep in slices; False if cancelled partway through."""
+        slept = 0.0
+        while slept < seconds:
+            if state.cancel_flag.is_set():
+                return False
+            time.sleep(min(0.1, seconds - slept))
+            slept += 0.1
+        return True
 
     while True:
         if state.cancel_flag.is_set():
@@ -1013,10 +1109,50 @@ def _poll_until_done(state: _WorkerState, job_id: str, *,
         if time.monotonic() > deadline:
             _cancel_cloud_job(state)
             raise RuntimeError(
-                f'Transcription timed out after {_POLL_TIMEOUT_SEC // 60} minutes. '
-                'The job may still finish on the server.')
+                f'Transcription still unfinished after '
+                f'{int(_POLL_TIMEOUT_SEC // 60)} minutes; giving up waiting. '
+                'The job may still complete on the server.')
 
-        job = _request(url, api_key=api_key)
+        try:
+            job = _request(url, api_key=api_key)
+        except CloudHTTPError as exc:
+            if not exc.transient:
+                raise
+            consecutive_failures += 1
+            last_error = f'HTTP {exc.status}'
+            if consecutive_failures >= _POLL_MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError(
+                    f'Lost contact with Subtitld Cloud while waiting for the '
+                    f'transcription ({last_error}, {consecutive_failures} tries). '
+                    'The job may have finished on the server — check your '
+                    'dashboard before paying to run it again.') from exc
+            wait = exc.retry_after or min(interval * 2, _POLL_INTERVAL_MAX_SEC)
+            log.warning('poll %s failed (%s); retry %d/%d in %.1fs',
+                        job_id, last_error, consecutive_failures,
+                        _POLL_MAX_CONSECUTIVE_FAILURES, wait)
+            _emit_progress(req_id, 0.3 + 0.6 * min(1.0, polls / 60.0),
+                           f'Waiting for Subtitld Cloud ({last_error})')
+            if not _sleep(wait):
+                _cancel_cloud_job(state)
+                return None
+            continue
+        except urllib.error.URLError as exc:
+            # Same reasoning as above: a dropped connection is not a reason to
+            # discard a running, paid-for job.
+            consecutive_failures += 1
+            last_error = str(getattr(exc, 'reason', exc))
+            if consecutive_failures >= _POLL_MAX_CONSECUTIVE_FAILURES:
+                raise
+            wait = min(interval * 2, _POLL_INTERVAL_MAX_SEC)
+            log.warning('poll %s network error (%s); retry %d/%d in %.1fs',
+                        job_id, last_error, consecutive_failures,
+                        _POLL_MAX_CONSECUTIVE_FAILURES, wait)
+            if not _sleep(wait):
+                _cancel_cloud_job(state)
+                return None
+            continue
+
+        consecutive_failures = 0
         status = str(job.get('status') or '').lower()
         polls += 1
 
@@ -1034,20 +1170,13 @@ def _poll_until_done(state: _WorkerState, job_id: str, *,
             frac = float(reported) / (100.0 if reported > 1 else 1.0)
             value = 0.3 + 0.6 * max(0.0, min(1.0, frac))
         else:
-            # No server-side number: approach 0.9 with a decaying step so the
-            # bar keeps moving without ever claiming to be done.
             value = 0.9 - 0.6 * (0.94 ** polls)
         _emit_progress(req_id, value, f'Transcribing ({status or "queued"})')
 
-        # Sleep in short slices so a cancel is honoured in well under a
-        # second rather than at the end of a 2 s poll interval.
-        slept = 0.0
-        while slept < _POLL_INTERVAL_SEC:
-            if state.cancel_flag.is_set():
-                _cancel_cloud_job(state)
-                return None
-            time.sleep(0.1)
-            slept += 0.1
+        if not _sleep(interval):
+            _cancel_cloud_job(state)
+            return None
+        interval = min(interval * _POLL_INTERVAL_GROWTH, _POLL_INTERVAL_MAX_SEC)
 
 
 # ---------------------------------------------------------------------------

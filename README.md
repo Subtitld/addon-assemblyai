@@ -28,9 +28,17 @@ cancel too, so the credit hold is released rather than left hanging.
 
 ## Requirements
 
+> [!WARNING]
+> **Subtitld Cloud is not publicly deployed yet.** The default endpoint
+> (`https://cloud.subtitld.org`) currently answers 404, so out of the box this
+> add-on cannot transcribe. Point **Configure → Cloud endpoint** at a running
+> Subtitld Cloud server, or set `SUBTITLD_CLOUD_BASE_URL` (honoured by every
+> cloud-backed add-on). Until the service launches, this add-on is only useful
+> if you have access to one.
+
 > [!IMPORTANT]
 > **A Subtitld Cloud API key is required** — not an AssemblyAI key. Generate one
-> at <https://cloud.subtitld.org/dashboard/keys/> and paste it into the add-on's
+> from your Subtitld Cloud dashboard and paste it into the add-on's
 > **Configure** dialog. The key is shared with Subtitld's other cloud-backed
 > providers, so you only enter it once.
 
@@ -118,12 +126,16 @@ Releases are built for Linux/macOS/Windows by the `Release` GitHub Action on a
 
 ## Known limitations
 
-- **Online only.** No offline fallback; a dropped connection fails the request.
+- **Online only.** No offline fallback. Transient failures while waiting for a
+  job (rate limits, 5xx, brief network drops) are retried with backoff, since
+  the transcription is already running and billed by then — but a sustained
+  outage still ends the request, and the message will tell you to check the
+  dashboard before paying to run it again.
 - **Partials arrive at the end.** AssemblyAI's batch API produces cues only when
   the job completes, so `partial` frames come as one burst rather than
   progressively. The add-on advertises `streaming: false` rather than promise a
   cadence it can't keep — progress is still reported throughout.
-- **15-minute ceiling** per request. A longer job keeps running server-side, but
+- **One-hour ceiling** per request. A longer job keeps running server-side, but
   this process stops waiting for it.
 
 ## License

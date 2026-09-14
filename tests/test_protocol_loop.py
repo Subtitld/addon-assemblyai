@@ -246,6 +246,40 @@ def test_402_points_at_topup():
     assert retry is False
 
 
+def test_404_with_html_body_blames_the_endpoint_not_the_model():
+    """The incident case: pointing at a host that serves no API.
+
+    Cloudflare/the origin answers 404 with an HTML page. Reporting that as
+    "unknown model" sends the user to refresh a catalog that was never the
+    problem, so a non-JSON 404 must blame base_url instead — at EVERY stage.
+    """
+    html = '<!doctype html><html><head><title>Not Found</title></head></html>'
+    for stage in ('upload', 'submit', 'poll'):
+        exc = addon.CloudHTTPError(404, html)
+        code, msg, retry = addon._translate_http_error(exc, BASE, stage)
+        assert code == addon.ERR_BAD_PARAMS, (stage, code)
+        assert 'No Subtitld Cloud API at' in msg, (stage, msg)
+        assert BASE in msg
+        assert 'model' not in msg.lower(), (stage, msg)
+        assert retry is False
+
+
+def test_404_on_upload_with_json_body_is_not_a_model_error():
+    """Upload does not involve a model, so it must never say one is unknown."""
+    exc = addon.CloudHTTPError(404, json.dumps({'error': 'not_found'}))
+    code, msg, _ = addon._translate_http_error(exc, BASE, 'upload')
+    assert code != addon.ERR_MODEL_MISSING
+    assert 'model' not in msg.lower(), msg
+
+
+def test_429_names_the_stage_and_endpoint():
+    """A bare "rate limited" hid a dead-endpoint problem for a whole session."""
+    exc = addon.CloudHTTPError(429, '')
+    code, msg, retry = addon._translate_http_error(exc, BASE, 'upload')
+    assert code == addon.ERR_NETWORK_UNAVAILABLE and retry is True
+    assert 'upload' in msg and BASE in msg
+
+
 def test_404_on_submit_is_unknown_model_but_on_poll_is_not():
     """Same status, different cause — the message has to say which."""
     code, msg, _ = addon._translate_http_error(
@@ -324,13 +358,21 @@ class _FakeCloud(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, *, polls_before_complete=2, completion=None, fail=None):
+    def __init__(self, *, polls_before_complete=2, completion=None, fail=None,
+                 poll_transient_status=0, poll_transient_count=0,
+                 retry_after=None):
         super().__init__(('127.0.0.1', 0), _FakeCloudHandler)
         self.polls_before_complete = polls_before_complete
         self.completion = completion or {}
         self.fail = fail or {}          # stage -> (status, body dict)
+        # Transient poll failures: the first `poll_transient_count` polls
+        # answer `poll_transient_status` before normal service resumes.
+        self.poll_transient_status = poll_transient_status
+        self.poll_transient_count = poll_transient_count
+        self.retry_after = retry_after
         self.seen = {'auth': [], 'submit': None, 'upload_bytes': 0,
-                     'polls': 0, 'cancelled': False, 'user_agents': []}
+                     'polls': 0, 'cancelled': False, 'user_agents': [],
+                     'poll_failures_served': 0}
 
     @property
     def base_url(self):
@@ -395,6 +437,17 @@ class _FakeCloudHandler(BaseHTTPRequestHandler):
             self._json(404, {'error': 'not_found'})
             return
         if self._maybe_fail('poll'):
+            return
+        if srv.seen['poll_failures_served'] < srv.poll_transient_count:
+            srv.seen['poll_failures_served'] += 1
+            body = b'{"error":"slow down"}'
+            self.send_response(srv.poll_transient_status)
+            self.send_header('Content-Type', 'application/json')
+            if srv.retry_after is not None:
+                self.send_header('Retry-After', str(srv.retry_after))
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         srv.seen['polls'] += 1
         if srv.seen['polls'] <= srv.polls_before_complete:
@@ -698,3 +751,87 @@ def test_server_side_job_failure_is_not_a_crash(cloud, wav):
     assert err['code'] == addon.ERR_INTERNAL
     assert 'worker crashed' not in err['message']
     assert 'upstream said no' in err['message']
+
+
+@needs_ffmpeg
+def test_transient_429_during_polling_does_not_lose_the_job(cloud, wav):
+    """The incident: the cloud transcribed and BILLED the job, then a single
+    429 mid-poll made the add-on discard the finished result.
+
+    By the time we poll, the money is spent and the job id lives only in this
+    process — so a transient failure must be ridden out, not treated as fatal.
+    """
+    cloud.poll_transient_status = 429
+    cloud.poll_transient_count = 3
+    cloud.retry_after = 1
+    cloud.completion = {
+        'audio_duration': 10.0,
+        'sentences': [{'start': 0, 'end': 2000, 'text': 'Survived the 429.'}],
+    }
+    a = _Addon({'ASSEMBLYAI_API_KEY': 'k', 'ASSEMBLYAI_BASE_URL': cloud.base_url})
+    try:
+        a.read_frame()
+        a.send({'type': 'ready'})
+        a.send({'type': 'asr.transcribe', 'id': 'r1',
+                'params': {'audio_path': wav, 'language': 'en'}})
+        result, _ = a.read_until('result', timeout=120)
+    finally:
+        a.close()
+    assert [s['text'] for s in result['data']['segments']] == ['Survived the 429.']
+    assert cloud.seen['poll_failures_served'] == 3, 'the 429s never fired'
+
+
+@needs_ffmpeg
+def test_transient_5xx_during_polling_is_also_survived(cloud, wav):
+    cloud.poll_transient_status = 503
+    cloud.poll_transient_count = 2
+    cloud.completion = {'audio_duration': 5.0, 'text': 'Still here.'}
+    a = _Addon({'ASSEMBLYAI_API_KEY': 'k', 'ASSEMBLYAI_BASE_URL': cloud.base_url})
+    try:
+        a.read_frame()
+        a.send({'type': 'ready'})
+        a.send({'type': 'asr.transcribe', 'id': 'r1',
+                'params': {'audio_path': wav, 'language': 'en'}})
+        result, _ = a.read_until('result', timeout=120)
+    finally:
+        a.close()
+    assert result['data']['segments'][0]['text'] == 'Still here.'
+
+
+@needs_ffmpeg
+def test_sustained_poll_failure_warns_the_job_may_have_completed(cloud, wav):
+    """Giving up is allowed — silently implying the work is gone is not.
+
+    The user has been charged; the message must send them to the dashboard
+    rather than straight to paying for a re-run.
+    """
+    cloud.poll_transient_status = 429
+    cloud.poll_transient_count = 10_000      # never recovers
+    a = _Addon({'ASSEMBLYAI_API_KEY': 'k', 'ASSEMBLYAI_BASE_URL': cloud.base_url})
+    try:
+        a.read_frame()
+        a.send({'type': 'ready'})
+        a.send({'type': 'asr.transcribe', 'id': 'r1',
+                'params': {'audio_path': wav, 'language': 'en'}})
+        err, _ = a.read_until('error', timeout=180)
+    finally:
+        a.close()
+    assert 'may have finished on the server' in err['message'], err['message']
+    assert cloud.seen['poll_failures_served'] >= addon._POLL_MAX_CONSECUTIVE_FAILURES - 1
+
+
+def test_retry_after_is_read_from_the_header():
+    exc = addon.CloudHTTPError(429, '{}', {'Retry-After': '7'})
+    assert exc.retry_after == 7.0
+    assert exc.transient is True
+    # A date-form or junk Retry-After must not explode; we fall back to backoff.
+    assert addon.CloudHTTPError(429, '{}', {'Retry-After': 'Wed, 21 Oct 2026 07:28:00 GMT'}).retry_after == 0.0
+    assert addon.CloudHTTPError(429, '{}', {}).retry_after == 0.0
+
+
+def test_only_429_and_5xx_count_as_transient():
+    """A 401 or 404 must still fail fast — retrying those just wastes time."""
+    for status in (400, 401, 402, 404, 413):
+        assert addon.CloudHTTPError(status, '{}').transient is False, status
+    for status in (429, 500, 502, 503, 504):
+        assert addon.CloudHTTPError(status, '{}').transient is True, status
