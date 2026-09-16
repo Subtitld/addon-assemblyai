@@ -835,3 +835,22 @@ def test_only_429_and_5xx_count_as_transient():
         assert addon.CloudHTTPError(status, '{}').transient is False, status
     for status in (429, 500, 502, 503, 504):
         assert addon.CloudHTTPError(status, '{}').transient is True, status
+
+
+def test_cloud_endpoint_is_not_a_user_setting():
+    """Which server to talk to is a developer concern, set for a whole session
+    via SUBTITLD_CLOUD_BASE_URL — not a field in the Configure panel. It was one
+    in 1.0.0/1.0.1 and was removed on request."""
+    manifest = json.loads((REPO_ROOT / 'manifest.json').read_text(encoding='utf-8'))
+    keys = {f['key'] for f in manifest['config_schema']['fields']}
+    assert 'base_url' not in keys, keys
+
+
+def test_errors_never_point_at_the_removed_setting():
+    """Messages must tell users about the env var that actually exists."""
+    html = '<!doctype html><title>Not Found</title>'
+    for exc, stage in ((addon.CloudHTTPError(404, html), 'upload'),
+                       (addon.CloudHTTPError(429, ''), 'poll')):
+        _, msg, _ = addon._translate_http_error(exc, BASE, stage)
+        assert 'Cloud endpoint setting' not in msg, msg
+        assert 'SUBTITLD_CLOUD_BASE_URL' in msg, msg

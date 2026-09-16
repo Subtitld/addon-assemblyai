@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "id": "assemblyai",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "display_name": "AssemblyAI (Subtitld Cloud)",
   "summary": "Cloud speech-to-text via AssemblyAI, routed through Subtitld Cloud. High accuracy with speaker diarization; needs a Subtitld Cloud API key and an internet connection.",
   "author": "Subtitld",
@@ -84,13 +84,6 @@
         "label": "One cue per sentence",
         "default": true,
         "description": "On: one subtitle per sentence, as segmented by AssemblyAI. Off: one subtitle per speaker turn (longer cues). Has no effect when the server returns only speaker turns."
-      },
-      {
-        "key": "base_url",
-        "type": "string",
-        "label": "Cloud endpoint",
-        "default": "",
-        "description": "Advanced. The default (https://cloud.subtitld.org) is the future production endpoint and is NOT deployed yet — until it is, point this at your Subtitld Cloud server, or set the SUBTITLD_CLOUD_BASE_URL environment variable, which every cloud-backed add-on honours."
       }
     ]
   }

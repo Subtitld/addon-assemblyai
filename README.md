@@ -31,9 +31,8 @@ cancel too, so the credit hold is released rather than left hanging.
 > [!WARNING]
 > **Subtitld Cloud is not publicly deployed yet.** The default endpoint
 > (`https://cloud.subtitld.org`) currently answers 404, so out of the box this
-> add-on cannot transcribe. Point **Configure → Cloud endpoint** at a running
-> Subtitld Cloud server, or set `SUBTITLD_CLOUD_BASE_URL` (honoured by every
-> cloud-backed add-on). Until the service launches, this add-on is only useful
+> add-on cannot transcribe. Set `SUBTITLD_CLOUD_BASE_URL` to a running Subtitld
+> Cloud server before launching Subtitld (honoured by every cloud-backed add-on). Until the service launches, this add-on is only useful
 > if you have access to one.
 
 > [!IMPORTANT]
@@ -67,10 +66,14 @@ Install it from Subtitld's **Add-ons** dialog, configure your API key, then pick
 | `model` | `subtitld-cloud:assemblyai/best` | `best` (most accurate) or `nano` (faster, cheaper, more languages). A bare `best`/`nano` is accepted and expanded. |
 | `speaker_labels` | `true` | Diarization — label each cue with who spoke it. |
 | `slice_by_phrases` | `true` | On: one cue per sentence. Off: one cue per speaker turn. |
-| `base_url` | `https://cloud.subtitld.org` | Advanced — point at a draft or self-hosted cloud. |
 
 Each can also be set per request through the host's `options`, or via the
-environment (`ASSEMBLYAI_API_KEY`, `ASSEMBLYAI_MODEL`, …). Resolution order is
+environment (`ASSEMBLYAI_API_KEY`, `ASSEMBLYAI_MODEL`, …).
+
+The cloud endpoint is deliberately **not** a setting: which server to talk to
+is a developer concern, not a user one. Point a whole Subtitld session at a
+different server with the `SUBTITLD_CLOUD_BASE_URL` environment variable, which
+every cloud-backed add-on honours. Resolution order is
 **request option → `ASSEMBLYAI_*` → `SUBTITLD_CLOUD_*`**, so the shared cloud
 credential slot works without re-entering the key here.
 

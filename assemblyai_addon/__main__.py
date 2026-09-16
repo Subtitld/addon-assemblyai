@@ -90,7 +90,7 @@ from pathlib import Path
 from typing import Any
 
 ADDON_ID = 'assemblyai'
-ADDON_VERSION = '1.0.1'
+ADDON_VERSION = '1.0.2'
 PROTOCOL_VERSION = 1
 
 # The cloud namespaces every provider it relays. Part of the API contract —
@@ -471,8 +471,8 @@ def _translate_http_error(exc: CloudHTTPError, base_url: str,
         if not exc.json_ok:
             return (ERR_BAD_PARAMS,
                     f'No Subtitld Cloud API at {base_url} — the server returned '
-                    f'"not found" for /api/v1/asr/. Check the Cloud endpoint '
-                    f'setting in the add-on configuration.',
+                    f'"not found" for /api/v1/asr/. Set SUBTITLD_CLOUD_BASE_URL to a '
+                    f'running Subtitld Cloud server and restart Subtitld.',
                     False)
         # Otherwise the API answered, and the 404 is about the thing we named.
         if stage == 'poll':
@@ -499,8 +499,8 @@ def _translate_http_error(exc: CloudHTTPError, base_url: str,
     if status == 429:
         return (ERR_NETWORK_UNAVAILABLE,
                 f'Rate limited by Subtitld Cloud during {stage} (at {base_url}). '
-                'Wait a moment and try again; if it repeats, check that the '
-                'Cloud endpoint setting points at a live server.',
+                'Wait a moment and try again; if it repeats, check that '
+                'SUBTITLD_CLOUD_BASE_URL points at a live server.',
                 True)
 
     if status == 503:
