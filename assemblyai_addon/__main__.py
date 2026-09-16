@@ -90,7 +90,7 @@ from pathlib import Path
 from typing import Any
 
 ADDON_ID = 'assemblyai'
-ADDON_VERSION = '1.0.2'
+ADDON_VERSION = '1.0.3'
 PROTOCOL_VERSION = 1
 
 # The cloud namespaces every provider it relays. Part of the API contract —
@@ -766,10 +766,12 @@ def _probe_duration(path: str) -> float:
     if not ffprobe:
         return 0.0
     try:
+        # Our stdin is the protocol channel. ffprobe has no `-nostdin` (it
+        # rejects the flag), so DEVNULL alone keeps it off host frames.
         proc = subprocess.run(
             [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
              '-of', 'default=noprint_wrappers=1:nokey=1', path],
-            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
             startupinfo=_no_window_startupinfo(),
         )
         return float((proc.stdout or '').strip())
@@ -790,13 +792,15 @@ def _encode_opus(src: str, dst: str) -> None:
         raise RuntimeError(
             'ffmpeg not found. Set SUBTITLD_FFMPEG_EXECUTABLE or put ffmpeg on PATH.')
 
+    # `-nostdin` plus stdin=DEVNULL: ffmpeg polls stdin for keystrokes, and
+    # ours carries host frames — a `cancel` sent mid-encode would vanish.
     proc = subprocess.run(
-        [ffmpeg, '-y', '-i', src,
+        [ffmpeg, '-nostdin', '-y', '-i', src,
          '-c:a', 'libopus', '-b:a', '24k', '-vbr', 'on',
          '-compression_level', '10', '-application', 'voip',
          '-ac', '1', '-ar', '48000',
          dst],
-        capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True,
         startupinfo=_no_window_startupinfo(),
     )
     if proc.returncode != 0 or not os.path.isfile(dst) or os.path.getsize(dst) == 0:

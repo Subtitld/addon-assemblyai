@@ -17,6 +17,7 @@ still run on a bare CI image.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -854,3 +856,118 @@ def test_errors_never_point_at_the_removed_setting():
         _, msg, _ = addon._translate_http_error(exc, BASE, stage)
         assert 'Cloud endpoint setting' not in msg, msg
         assert 'SUBTITLD_CLOUD_BASE_URL' in msg, msg
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg must not read the protocol channel
+# ---------------------------------------------------------------------------
+# Stand-in for ffmpeg/ffprobe. Once the test has queued host frames it takes
+# every byte its stdin offers — the worst case of ffmpeg's keyboard polling,
+# which eats queued frames whenever it shares the add-on's stdin.
+_STDIN_EATER = '''
+import json, os, select, sys, time
+from pathlib import Path
+
+tool = Path(sys.argv[0]).name
+work = Path(os.environ['STUB_FFMPEG_DIR'])
+(work / 'started').touch()
+deadline = time.monotonic() + 10
+while not (work / 'go').exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+consumed = 0
+while select.select([0], [], [], 0.5)[0]:
+    chunk = os.read(0, 4096)
+    if not chunk:
+        break
+    consumed += len(chunk)
+(work / 'report.json').write_text(json.dumps({'argv': sys.argv[1:], 'consumed': consumed}))
+if tool == 'ffprobe':
+    if '-nostdin' in sys.argv:  # the real ffprobe rejects it too
+        sys.exit("Failed to set value for option 'nostdin': Option not found")
+    print('1.5')
+else:
+    Path(sys.argv[-1]).write_bytes(b'OggS stub')
+'''
+
+
+@contextlib.contextmanager
+def _host_pipe_as_stdin():
+    """Put a fresh pipe on fd 0, where host frames arrive; yield its write end."""
+    read_fd, write_fd = os.pipe()
+    saved = os.dup(0)
+    os.dup2(read_fd, 0)
+    os.close(read_fd)
+    host = os.fdopen(write_fd, 'wb')
+    try:
+        yield host
+    finally:
+        host.close()
+        os.dup2(saved, 0)
+        os.close(saved)
+
+
+def _wait_until_started(marker, job):
+    deadline = time.monotonic() + 10
+    while not marker.exists():
+        if job.done():
+            job.result()  # surfaces the helper's own error
+            raise AssertionError('helper returned without running the stand-in')
+        assert time.monotonic() < deadline, 'stand-in never started'
+        time.sleep(0.01)
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='the stand-in is a shebang script')
+@pytest.mark.parametrize('tool', ['ffmpeg', 'ffprobe'])
+def test_ffmpeg_does_not_swallow_queued_host_frames(tool, tmp_path, monkeypatch):
+    """A `cancel` sent while audio encodes must still reach the dispatcher.
+
+    In-process on purpose: through the `_Addon` harness the dispatcher thread
+    races ffmpeg for each frame, so a regression would only fail sometimes.
+    Here the stand-in is the only other reader, so it fails every time.
+    """
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    for name in ('ffmpeg', 'ffprobe'):  # ffprobe is looked up beside ffmpeg
+        stub = bindir / name
+        stub.write_text(f'#!{sys.executable}\n{_STDIN_EATER}', encoding='utf-8')
+        stub.chmod(0o755)
+    monkeypatch.setenv('SUBTITLD_FFMPEG_EXECUTABLE', str(bindir / 'ffmpeg'))
+    monkeypatch.setenv('STUB_FFMPEG_DIR', str(tmp_path))
+    src = tmp_path / 'in.wav'
+    src.write_bytes(b'RIFF')
+    if tool == 'ffmpeg':
+        def run():
+            return addon._encode_opus(str(src), str(tmp_path / 'out.opus'))
+    else:
+        def run():
+            return addon._probe_duration(str(src))
+
+    sent = [
+        {'type': 'cancel', 'target': 'r1'},
+        {'type': 'asr.transcribe', 'id': 'r2', 'params': {'audio_path': str(src)}},
+        {'type': 'cancel', 'target': 'r2'},
+        {'type': 'shutdown'},
+    ]
+    received = []
+    with _host_pipe_as_stdin() as host, ThreadPoolExecutor(1) as pool:
+        job = pool.submit(run)
+        _wait_until_started(tmp_path / 'started', job)
+        for frame in sent:
+            host.write((json.dumps(frame) + '\n').encode())
+        host.close()
+        (tmp_path / 'go').touch()
+        result = job.result(timeout=30)
+
+        with open(0, encoding='utf-8', closefd=False) as stdin:
+            monkeypatch.setattr(sys, 'stdin', stdin)
+            while (frame := addon._read_frame_blocking()) is not None:
+                received.append(frame)
+
+    assert received == sent, 'host frames were lost while the tool ran'
+    report = json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
+    assert report['consumed'] == 0, 'the tool was handed the protocol stdin'
+    if tool == 'ffmpeg':
+        assert '-nostdin' in report['argv']
+    else:
+        # ffprobe has no -nostdin, and _probe_duration reads any failure as 0.0.
+        assert result == 1.5

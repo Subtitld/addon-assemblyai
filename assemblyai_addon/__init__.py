@@ -5,6 +5,6 @@ The package exists so the entry-point can be invoked both directly
 PyInstaller binary (`assemblyai-addon/assemblyai-addon`).
 """
 
-__version__ = '1.0.2'
+__version__ = '1.0.3'
 ADDON_ID = 'assemblyai'
 PROTOCOL_VERSION = 1
