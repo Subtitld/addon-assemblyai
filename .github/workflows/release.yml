@@ -86,6 +86,19 @@ jobs:
         run: |
           pyinstaller pyinstaller.spec --noconfirm
 
+      # The runner keeps its CA store exactly where the bundled OpenSSL looks,
+      # which hides a build that can't verify certificates anywhere else
+      # (macOS, Fedora/Arch, the Flatpak runtime). The smoke test runs the
+      # binary with SSL_CERT_FILE/SSL_CERT_DIR pointing at nothing and calls
+      # Subtitld Cloud; on Linux it also checks that ffmpeg doesn't inherit
+      # the bundle's LD_LIBRARY_PATH. Skipped on Windows, where Python reads
+      # the system certificate store directly.
+      - name: Smoke-test the frozen binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          python tools/smoke_frozen.py dist/assemblyai-addon/assemblyai-addon
+
       - name: Stage release archive
         shell: bash
         run: |

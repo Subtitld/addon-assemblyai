@@ -20,7 +20,7 @@ Subtitld ──stdio──▶ this add-on ──HTTPS──▶ Subtitld Cloud �
 
 That indirection is deliberate: signature/webhook verification, credit
 hold-and-settle, and upstream retry handling all live server-side, so this
-process stays a small stdlib-only HTTP client.
+process stays a small stdlib HTTP client (plus certifi, for its CA bundle).
 
 One request runs: **encode** (ffmpeg → mono 24 kbps Opus) → **upload** →
 **submit** → **poll every 2 s** → **emit cues**. Cancelling tells the cloud to
@@ -122,7 +122,13 @@ Build the bundle:
 ```bash
 pip install -e '.[build]'
 pyinstaller pyinstaller.spec --noconfirm   # -> dist/assemblyai-addon/
+python tools/smoke_frozen.py dist/assemblyai-addon/assemblyai-addon
 ```
+
+The smoke test (CI runs it after every Linux and macOS build) drives the
+frozen binary with no system CA store, as on macOS, Fedora/Arch or the Flatpak
+runtime, and checks that ffmpeg does not inherit the bundle's
+`LD_LIBRARY_PATH`.
 
 Releases are built for Linux/macOS/Windows by the `Release` GitHub Action on a
 `v*` tag and published to the Subtitld add-ons catalog.

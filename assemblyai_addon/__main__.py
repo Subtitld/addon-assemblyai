@@ -8,13 +8,14 @@ free-form logging — the host prefixes each line with
 
 What this add-on is
 -------------------
-A thin, **stdlib-only** client for Subtitld Cloud's ASR relay. It never
+A thin, **stdlib-only** client for Subtitld Cloud's ASR relay — the one
+third-party package is certifi, for its CA bundle. It never
 talks to AssemblyAI directly and never holds an upstream provider key:
 the cloud stores that, and the desktop authenticates to the *cloud* with
 the user's own Subtitld Cloud key. That indirection is the entire point —
 signature/webhook verification, credit hold-and-settle, and upstream 5xx
 retries all live server-side, so this process stays small enough to freeze
-into a ~10 MB bundle with no third-party wheels.
+into a ~10 MB bundle.
 
 Request lifecycle (one `asr.transcribe`)
 ----------------------------------------
@@ -70,12 +71,14 @@ time regardless.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import mimetypes
 import os
 import platform
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -90,7 +93,7 @@ from pathlib import Path
 from typing import Any
 
 ADDON_ID = 'assemblyai'
-ADDON_VERSION = '1.0.3'
+ADDON_VERSION = '1.0.4'
 PROTOCOL_VERSION = 1
 
 # The cloud namespaces every provider it relays. Part of the API contract —
@@ -272,9 +275,31 @@ def _opt_bool(options: dict, key: str, env_name: str, default: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# HTTP. Stdlib only — `requests` would mean a wheel in the frozen bundle for
-# what amounts to four calls.
+# HTTP. Stdlib urllib — `requests` would mean a wheel in the frozen bundle for
+# what amounts to four calls. certifi is the exception: it is a CA bundle,
+# and the frozen build cannot verify certificates without it.
 # ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _https_context() -> ssl.SSLContext:
+    """TLS context that trusts the system's CAs plus certifi's bundle.
+
+    The frozen build carries its own OpenSSL, which looks for CA certificates
+    where the *build* machine keeps them (`/usr/lib/ssl` on the Ubuntu
+    runner, an empty python.org framework path on macOS). On macOS, Fedora,
+    Arch or the Flatpak runtime that path holds nothing, and every cloud call
+    failed with CERTIFICATE_VERIFY_FAILED. certifi's bundle ships inside the
+    add-on, so it is always there; the system store is kept too, so a CA the
+    user trusts locally (a corporate proxy's, say) still verifies.
+    """
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception as exc:
+        log.warning('certifi CA bundle unavailable, trusting system CAs only: %s', exc)
+    return ctx
+
+
 class CloudHTTPError(Exception):
     """An HTTP error from the cloud, with the parsed body kept intact.
 
@@ -363,7 +388,7 @@ def _request(url: str, *, api_key: str, method: str = 'GET',
         req.add_header('Content-Type', content_type)
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_https_context()) as resp:
             raw = resp.read().decode('utf-8', errors='replace')
     except urllib.error.HTTPError as exc:
         try:
@@ -525,6 +550,33 @@ def _translate_http_error(exc: CloudHTTPError, base_url: str,
     detail = exc.body_text[:300].strip()
     suffix = f' {detail}' if detail else ''
     return (ERR_INTERNAL, f'Subtitld Cloud {stage} failed (HTTP {status}).{suffix}', False)
+
+
+def _cert_error(exc: BaseException) -> ssl.SSLCertVerificationError | None:
+    """The certificate failure behind a urllib error, if that is what it is."""
+    reason = getattr(exc, 'reason', exc)
+    return reason if isinstance(reason, ssl.SSLCertVerificationError) else None
+
+
+def _translate_url_error(exc: urllib.error.URLError, base_url: str,
+                         failed: str) -> tuple[str, str, bool]:
+    """Map a failure below HTTP to `(code, message, retryable)`.
+
+    A certificate that does not verify is not a connectivity problem, and
+    "could not reach" sends the user off to check a connection that works.
+    Retrying doesn't help either — the same certificate comes back.
+    """
+    cert = _cert_error(exc)
+    if cert is None:
+        return (ERR_NETWORK_UNAVAILABLE, f'{failed}: {exc.reason}', True)
+    host = urllib.parse.urlsplit(base_url).hostname or base_url
+    detail = getattr(cert, 'verify_message', '') or str(cert)
+    return (ERR_NETWORK_UNAVAILABLE,
+            f'Could not verify the security certificate of {host} ({detail}). '
+            "Check that this computer's date and time are correct. If a proxy "
+            'or antivirus inspects HTTPS traffic, its certificate must be '
+            'trusted by the system.',
+            False)
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +800,28 @@ def _no_window_startupinfo():
     return si
 
 
+def _tool_env() -> dict[str, str] | None:
+    """Environment for ffmpeg/ffprobe; None inherits ours unchanged.
+
+    The frozen Linux build's bootloader points LD_LIBRARY_PATH at the
+    bundle's `_internal` so the add-on finds its own libraries. A system
+    ffmpeg that inherits it loads our libssl, libz and friends (from the
+    build runner) instead of its own, and fails to start on a distro newer
+    than the runner. PyInstaller keeps the user's value in
+    LD_LIBRARY_PATH_ORIG; restoring it, or dropping the variable when there
+    was none, is its documented fix for child processes.
+    """
+    if not (getattr(sys, 'frozen', False) and sys.platform.startswith('linux')):
+        return None
+    env = dict(os.environ)
+    original = env.get('LD_LIBRARY_PATH_ORIG')
+    if original is not None:
+        env['LD_LIBRARY_PATH'] = original
+    else:
+        env.pop('LD_LIBRARY_PATH', None)
+    return env
+
+
 def _probe_duration(path: str) -> float:
     """Best-effort source duration in seconds, 0.0 when unknown.
 
@@ -772,7 +846,7 @@ def _probe_duration(path: str) -> float:
             [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
              '-of', 'default=noprint_wrappers=1:nokey=1', path],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
-            startupinfo=_no_window_startupinfo(),
+            env=_tool_env(), startupinfo=_no_window_startupinfo(),
         )
         return float((proc.stdout or '').strip())
     except Exception:
@@ -801,7 +875,7 @@ def _encode_opus(src: str, dst: str) -> None:
          '-ac', '1', '-ar', '48000',
          dst],
         stdin=subprocess.DEVNULL, capture_output=True, text=True,
-        startupinfo=_no_window_startupinfo(),
+        env=_tool_env(), startupinfo=_no_window_startupinfo(),
     )
     if proc.returncode != 0 or not os.path.isfile(dst) or os.path.getsize(dst) == 0:
         tail = (proc.stderr or '').strip().splitlines()[-3:]
@@ -949,8 +1023,8 @@ def _handle_transcribe(state: _WorkerState, params: dict) -> None:
             _emit_error(req_id, code, message, retryable)
             return
         except urllib.error.URLError as exc:
-            _emit_error(req_id, ERR_NETWORK_UNAVAILABLE,
-                        f'Could not reach Subtitld Cloud: {exc.reason}', True)
+            _emit_error(req_id, *_translate_url_error(
+                exc, base_url, 'Could not reach Subtitld Cloud'))
             return
         except Exception as exc:
             _emit_error(req_id, ERR_INTERNAL, f'Upload failed: {exc}')
@@ -979,8 +1053,8 @@ def _handle_transcribe(state: _WorkerState, params: dict) -> None:
             _emit_error(req_id, code, message, retryable)
             return
         except urllib.error.URLError as exc:
-            _emit_error(req_id, ERR_NETWORK_UNAVAILABLE,
-                        f'Could not reach Subtitld Cloud: {exc.reason}', True)
+            _emit_error(req_id, *_translate_url_error(
+                exc, base_url, 'Could not reach Subtitld Cloud'))
             return
 
         job_id = str(response.get('id') or '')
@@ -999,8 +1073,8 @@ def _handle_transcribe(state: _WorkerState, params: dict) -> None:
             _emit_error(req_id, code, message, retryable)
             return
         except urllib.error.URLError as exc:
-            _emit_error(req_id, ERR_NETWORK_UNAVAILABLE,
-                        f'Lost contact with Subtitld Cloud: {exc.reason}', True)
+            _emit_error(req_id, *_translate_url_error(
+                exc, base_url, 'Lost contact with Subtitld Cloud'))
             return
         except RuntimeError as exc:
             # Job failed server-side, or the 15-minute ceiling hit. Both are
@@ -1142,7 +1216,10 @@ def _poll_until_done(state: _WorkerState, job_id: str, *,
             continue
         except urllib.error.URLError as exc:
             # Same reasoning as above: a dropped connection is not a reason to
-            # discard a running, paid-for job.
+            # discard a running, paid-for job. A bad certificate is: it will
+            # be just as bad on every retry.
+            if _cert_error(exc) is not None:
+                raise
             consecutive_failures += 1
             last_error = str(getattr(exc, 'reason', exc))
             if consecutive_failures >= _POLL_MAX_CONSECUTIVE_FAILURES:

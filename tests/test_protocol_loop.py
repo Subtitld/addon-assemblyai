@@ -21,10 +21,12 @@ import contextlib
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -359,6 +361,7 @@ class _FakeCloud(ThreadingHTTPServer):
     """Records what the add-on sent and replays a scripted job lifecycle."""
 
     daemon_threads = True
+    scheme = 'http'
 
     def __init__(self, *, polls_before_complete=2, completion=None, fail=None,
                  poll_transient_status=0, poll_transient_count=0,
@@ -379,7 +382,7 @@ class _FakeCloud(ThreadingHTTPServer):
     @property
     def base_url(self):
         host, port = self.server_address[:2]
-        return f'http://{host}:{port}'
+        return f'{self.scheme}://{host}:{port}'
 
 
 class _FakeCloudHandler(BaseHTTPRequestHandler):
@@ -971,3 +974,241 @@ def test_ffmpeg_does_not_swallow_queued_host_frames(tool, tmp_path, monkeypatch)
     else:
         # ffprobe has no -nostdin, and _probe_duration reads any failure as 0.0.
         assert result == 1.5
+
+
+# ---------------------------------------------------------------------------
+# TLS: the frozen build's OpenSSL may find no system CA store at all
+# ---------------------------------------------------------------------------
+HAS_OPENSSL = shutil.which('openssl') is not None
+
+
+@pytest.fixture
+def fresh_https_context():
+    """`_https_context` is cached per process; these tests change its inputs."""
+    addon._https_context.cache_clear()
+    yield
+    addon._https_context.cache_clear()
+
+
+def _no_system_ca_store(monkeypatch, tmp_path):
+    """What the frozen OpenSSL sees on a machine laid out unlike the build host."""
+    monkeypatch.setenv('SSL_CERT_FILE', str(tmp_path / 'no-such-ca-file.pem'))
+    monkeypatch.setenv('SSL_CERT_DIR', str(tmp_path / 'no-such-ca-dir'))
+
+
+@pytest.fixture(scope='module')
+def test_ca(tmp_path_factory):
+    """A throwaway CA, and a certificate for 127.0.0.1 signed by it.
+
+    certifi has never heard of this CA, so trusting it proves the system
+    store is still consulted alongside certifi.
+    """
+    if not HAS_OPENSSL:
+        pytest.skip('openssl CLI not installed')
+    d = tmp_path_factory.mktemp('tls')
+
+    def openssl(*args):
+        subprocess.run(['openssl', *args], cwd=d, check=True, capture_output=True)
+
+    openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2',
+            '-subj', '/CN=Subtitld add-on test CA',
+            '-addext', 'basicConstraints=critical,CA:TRUE',
+            '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+            '-keyout', 'ca.key', '-out', 'ca.pem')
+    openssl('req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=127.0.0.1',
+            '-keyout', 'server.key', '-out', 'server.csr')
+    # Python 3.13+ verifies in X509-strict mode, which wants these extensions.
+    (d / 'server.ext').write_text(
+        'basicConstraints=critical,CA:FALSE\n'
+        'keyUsage=critical,digitalSignature,keyEncipherment\n'
+        'extendedKeyUsage=serverAuth\n'
+        'subjectAltName=IP:127.0.0.1\n'
+        'subjectKeyIdentifier=hash\n'
+        'authorityKeyIdentifier=keyid,issuer\n')
+    openssl('x509', '-req', '-in', 'server.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key',
+            '-set_serial', '1', '-days', '2', '-extfile', 'server.ext',
+            '-out', 'server.pem')
+    return d
+
+
+@pytest.fixture
+def tls_cloud(test_ca):
+    """The fake cloud behind HTTPS, with a certificate from `test_ca`."""
+    server = _FakeCloud()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(test_ca / 'server.pem', test_ca / 'server.key')
+    # Handshakes run inside accept(), where a client's rejection is dropped
+    # quietly instead of printing a traceback from a handler thread.
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    server.scheme = 'https'
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.mark.skipif(sys.platform == 'win32',
+                    reason='Python on Windows reads the system store directly')
+def test_certifi_is_trusted_when_the_system_store_is_missing(
+        fresh_https_context, monkeypatch, tmp_path):
+    import certifi
+
+    _no_system_ca_store(monkeypatch, tmp_path)
+    assert ssl.create_default_context().cert_store_stats()['x509_ca'] == 0, \
+        'precondition: the env vars must hide the system store'
+    bundled = ssl.create_default_context(cafile=certifi.where())
+    assert (addon._https_context().cert_store_stats()['x509_ca']
+            == bundled.cert_store_stats()['x509_ca'])
+
+
+def test_certificate_errors_are_not_reported_as_connection_problems(
+        fresh_https_context, tls_cloud, monkeypatch, tmp_path):
+    _no_system_ca_store(monkeypatch, tmp_path)
+    with pytest.raises(urllib.error.URLError) as info:
+        addon._request(f'{tls_cloud.base_url}/api/v1/jobs/x', api_key='k')
+    code, message, retryable = addon._translate_url_error(
+        info.value, tls_cloud.base_url, 'Could not reach Subtitld Cloud')
+    assert code == addon.ERR_NETWORK_UNAVAILABLE
+    assert 'security certificate of 127.0.0.1' in message
+    assert 'date and time' in message
+    assert 'Could not reach' not in message
+    assert retryable is False
+
+
+def test_plain_network_errors_keep_the_connection_message():
+    exc = urllib.error.URLError(ConnectionRefusedError(111, 'Connection refused'))
+    code, message, retryable = addon._translate_url_error(
+        exc, BASE, 'Could not reach Subtitld Cloud')
+    assert code == addon.ERR_NETWORK_UNAVAILABLE
+    assert message.startswith('Could not reach Subtitld Cloud:')
+    assert retryable is True
+
+
+def test_poll_gives_up_at_once_on_a_certificate_error(monkeypatch):
+    """Retrying a certificate that won't verify only delays the real message."""
+    calls = []
+
+    def _refuse(url, **kwargs):
+        calls.append(url)
+        raise urllib.error.URLError(
+            ssl.SSLCertVerificationError(1, 'certificate verify failed'))
+
+    monkeypatch.setattr(addon, '_request', _refuse)
+    monkeypatch.setattr(addon, '_emit', lambda frame: None)
+    with pytest.raises(urllib.error.URLError):
+        addon._poll_until_done(addon._WorkerState('r1'), 'job-1',
+                               base_url=BASE, api_key='k')
+    assert len(calls) == 1
+
+
+@needs_ffmpeg
+def test_system_trusted_ca_still_verifies_end_to_end(tls_cloud, test_ca, wav, tmp_path):
+    """certifi is added to the system store, not swapped in for it.
+
+    `cafile=certifi.where()` alone would reject a CA only the system trusts,
+    such as a corporate proxy's. Here SSL_CERT_FILE plays the system store
+    and holds a CA certifi does not know.
+    """
+    tls_cloud.completion = {'audio_duration': 1.0, 'text': 'Over TLS.'}
+    a = _Addon({'ASSEMBLYAI_API_KEY': 'k', 'ASSEMBLYAI_BASE_URL': tls_cloud.base_url,
+                'SSL_CERT_FILE': str(test_ca / 'ca.pem'),
+                'SSL_CERT_DIR': str(tmp_path / 'no-such-ca-dir')})
+    try:
+        a.read_frame()
+        a.send({'type': 'ready'})
+        a.send({'type': 'asr.transcribe', 'id': 'r1',
+                'params': {'audio_path': wav, 'language': 'en'}})
+        result, _ = a.read_until('result')
+    finally:
+        a.close()
+    assert [s['text'] for s in result['data']['segments']] == ['Over TLS.']
+
+
+@needs_ffmpeg
+def test_untrusted_certificate_reaches_the_host_as_such(tls_cloud, wav, tmp_path):
+    a = _Addon({'ASSEMBLYAI_API_KEY': 'k', 'ASSEMBLYAI_BASE_URL': tls_cloud.base_url,
+                'SSL_CERT_FILE': str(tmp_path / 'no-such-ca-file.pem'),
+                'SSL_CERT_DIR': str(tmp_path / 'no-such-ca-dir')})
+    try:
+        a.read_frame()
+        a.send({'type': 'ready'})
+        a.send({'type': 'asr.transcribe', 'id': 'r1',
+                'params': {'audio_path': wav, 'language': 'en'}})
+        err, _ = a.read_until('error')
+    finally:
+        a.close()
+    assert err['code'] == addon.ERR_NETWORK_UNAVAILABLE
+    assert 'security certificate' in err['message']
+    assert 'Could not reach' not in err['message']
+    assert err['retryable'] is False
+    assert tls_cloud.seen['upload_bytes'] == 0
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg must not inherit the frozen bundle's library path
+# ---------------------------------------------------------------------------
+# Stand-in for ffmpeg/ffprobe that refuses to run with the bundle on
+# LD_LIBRARY_PATH — the real ones would load the bundle's older libssl and
+# libz, and fail to start on a distro newer than the build runner.
+_LIBRARY_PATH_CHECKER = '''
+import json, os, sys
+from pathlib import Path
+
+tool = Path(sys.argv[0]).name
+seen = os.environ.get('LD_LIBRARY_PATH')
+work = Path(os.environ['STUB_FFMPEG_DIR'])
+(work / f'{tool}.json').write_text(json.dumps({'LD_LIBRARY_PATH': seen}))
+if seen is not None and os.environ['STUB_BUNDLE_LIBS'] in seen.split(os.pathsep):
+    sys.exit(f'started with the bundle on LD_LIBRARY_PATH: {seen}')
+if tool == 'ffprobe':
+    print('1.5')
+else:
+    Path(sys.argv[-1]).write_bytes(b'OggS stub')
+'''
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'),
+                    reason='PyInstaller rewrites LD_LIBRARY_PATH on Linux only')
+@pytest.mark.parametrize('users_value', [None, '/opt/users/lib'])
+def test_ffmpeg_does_not_inherit_the_bundle_library_path(
+        users_value, tmp_path, monkeypatch):
+    """Frozen, the bootloader has put `_internal` first on LD_LIBRARY_PATH
+    and saved any earlier value in LD_LIBRARY_PATH_ORIG. ffmpeg must see the
+    user's value again, or no variable at all if they had none."""
+    bundle_libs = tmp_path / 'assemblyai-addon' / '_internal'
+    bundle_libs.mkdir(parents=True)
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    for name in ('ffmpeg', 'ffprobe'):
+        stub = bindir / name
+        stub.write_text(f'#!{sys.executable}\n{_LIBRARY_PATH_CHECKER}', encoding='utf-8')
+        stub.chmod(0o755)
+
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    if users_value is None:
+        monkeypatch.setenv('LD_LIBRARY_PATH', str(bundle_libs))
+        monkeypatch.delenv('LD_LIBRARY_PATH_ORIG', raising=False)
+    else:
+        monkeypatch.setenv('LD_LIBRARY_PATH', f'{bundle_libs}{os.pathsep}{users_value}')
+        monkeypatch.setenv('LD_LIBRARY_PATH_ORIG', users_value)
+    monkeypatch.setenv('SUBTITLD_FFMPEG_EXECUTABLE', str(bindir / 'ffmpeg'))
+    monkeypatch.setenv('STUB_FFMPEG_DIR', str(tmp_path))
+    monkeypatch.setenv('STUB_BUNDLE_LIBS', str(bundle_libs))
+    src = tmp_path / 'in.wav'
+    src.write_bytes(b'RIFF')
+
+    # _probe_duration reads any ffprobe failure as 0.0.
+    assert addon._probe_duration(str(src)) == 1.5
+    addon._encode_opus(str(src), str(tmp_path / 'out.opus'))  # raises if ffmpeg failed
+
+    for tool in ('ffmpeg', 'ffprobe'):
+        report = json.loads((tmp_path / f'{tool}.json').read_text(encoding='utf-8'))
+        assert report['LD_LIBRARY_PATH'] == users_value, tool
+
+
+def test_unfrozen_runs_pass_the_environment_through(monkeypatch):
+    """From source there is no bundle, and a developer's LD_LIBRARY_PATH is
+    theirs to keep."""
+    monkeypatch.delattr(sys, 'frozen', raising=False)
+    assert addon._tool_env() is None

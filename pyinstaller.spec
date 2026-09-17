@@ -3,7 +3,8 @@
 
 Produces `dist/assemblyai-addon/` containing the launcher binary
 (`assemblyai-addon`, `.exe` on Windows) and nothing else of substance — the
-add-on is stdlib-only, so the bundle is essentially CPython plus one module.
+add-on is stdlib-only apart from certifi, so the bundle is essentially CPython,
+one module and a CA bundle.
 
 Run from the addon root:
 
@@ -18,17 +19,28 @@ consumed by Subtitld's AddonsDialog.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 
 SPEC_ROOT = Path(SPECPATH).resolve()
+
+# certifi supplies the CA bundle the add-on verifies Subtitld Cloud against
+# (see `_https_context`). Without it the build still succeeds and the binary
+# still starts, then fails every HTTPS call on machines whose CA store is not
+# where the build host keeps it. Fail here instead.
+if importlib.util.find_spec('certifi') is None:
+    raise SystemExit('FATAL: certifi is not installed. '
+                     "Run `pip install -e '.[build]'` first.")
 
 a = Analysis(
     [str(SPEC_ROOT / 'assemblyai_addon' / '__main__.py')],
     pathex=[str(SPEC_ROOT)],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    # Imported inside `_https_context`; named here so it can't be missed.
+    # Its hook (pyinstaller-hooks-contrib) copies cacert.pem.
+    hiddenimports=['certifi'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -68,6 +80,10 @@ def _drop_bundled_libexpat(entries):
 
 
 a.binaries = _drop_bundled_libexpat(a.binaries)
+
+if not any(dest.replace('\\', '/') == 'certifi/cacert.pem' for dest, *_ in a.datas):
+    raise SystemExit('FATAL: certifi/cacert.pem was not collected; '
+                     'is pyinstaller-hooks-contrib installed?')
 
 pyz = PYZ(a.pure, a.zipped_data)
 
