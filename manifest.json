@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "id": "assemblyai",
-  "version": "1.0.4",
+  "version": "26.11.1",
   "display_name": "AssemblyAI (Subtitld Cloud)",
   "summary": "Cloud speech-to-text via AssemblyAI, routed through Subtitld Cloud. High accuracy with speaker diarization; needs a Subtitld Cloud API key and an internet connection.",
   "author": "Subtitld",

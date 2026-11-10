@@ -93,7 +93,7 @@ from pathlib import Path
 from typing import Any
 
 ADDON_ID = 'assemblyai'
-ADDON_VERSION = '1.0.4'
+ADDON_VERSION = '26.11.1'
 PROTOCOL_VERSION = 1
 
 # The cloud namespaces every provider it relays. Part of the API contract —
