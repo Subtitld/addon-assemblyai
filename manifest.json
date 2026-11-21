@@ -46,6 +46,7 @@
   "disk_required_mb": 50,
   "ram_required_mb": 256,
   "gpu": "none",
+  "compute": "remote",
   "config_schema": {
     "fields": [
       {
