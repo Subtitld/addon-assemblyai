@@ -136,9 +136,44 @@ jobs:
             ${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
+  build-haiku:
+    name: Build haiku-x86_64
+    needs: test
+    runs-on: ubuntu-22.04
+    # Not frozen: on Haiku the add-on runs on HaikuPorts' Python, and what it
+    # imports comes from the Haiku packages manifest.json lists. Pure Python,
+    # so it builds here; see tools/build_haiku.py.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build the Haiku zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(python tools/build_haiku.py)
+          archive_name=$(basename "$archive")
+          python -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" \
+            "$archive_name" > "${archive_name}.sha256"
+          cat "${archive_name}.sha256"
+          echo "ARCHIVE_NAME=$archive_name" >> "$GITHUB_ENV"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: haiku-x86_64
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-haiku]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
 

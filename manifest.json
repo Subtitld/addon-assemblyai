@@ -14,7 +14,12 @@
   "platforms": [
     "linux",
     "macos",
-    "windows"
+    "windows",
+    "haiku"
+  ],
+  "haiku_packages": [
+    "python3.14",
+    "certifi_python3.14"
   ],
   "tasks": [
     "asr.transcribe"
