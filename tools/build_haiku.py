@@ -37,8 +37,11 @@ PLATFORM_LABEL = 'haiku-x86_64'
 
 LAUNCHER = '''#!/bin/sh
 # Subtitld add-on launcher for Haiku: runs the add-on on HaikuPorts' Python.
-here=$(cd "$(dirname "$0")" && pwd -P)
-exec {python} -I "$here/boot.py" "$@"
+# Shell builtins and the package's own path only: the add-on may be started
+# with a PATH that has neither dirname nor Python on it.
+case $0 in */*) here=${{0%/*}} ;; *) here=. ;; esac
+here=$(cd "$here" && pwd -P)
+exec /boot/system/bin/{python} -I "$here/boot.py" "$@"
 '''
 
 # -I: no PYTHONPATH, user site or script folder from whoever started us
